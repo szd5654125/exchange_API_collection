@@ -115,6 +115,27 @@ class BinanceFuturesAPI:
             async with session.get(path, timeout=30, ssl=True) as response:
                 return await response.json()
 
+    async def get_um_max_leverage(self, symbol: str, notional: float = 0.0) -> int:
+        path = f"{self.BASE_FAPI_URL_V1}/leverageBracket"
+        response = await self._get(path, {"symbol": symbol})
+        if isinstance(response, dict) and "code" in response:
+            raise RuntimeError(f"API 返回错误: {response}")
+        items = response if isinstance(response, list) else [response]
+        for item in items:
+            if item["symbol"] == symbol:
+                brackets = item["brackets"]
+                if notional == 0:
+                    # 取所有层级中的最大 initialLeverage
+                    return max(int(b["initialLeverage"]) for b in brackets)
+                else:
+                    # 找到对应名义价值所在的层级
+                    for b in brackets:
+                        if b["notionalFloor"] <= notional < b["notionalCap"]:
+                            return int(b["initialLeverage"])
+                    # 如果超过所有区间，则使用最低层
+                    return int(brackets[-1]["initialLeverage"])
+        raise ValueError(f"未找到交易对 {symbol} 的杠杆分层信息")
+
     def check_if_um_future_trading(self, symbol):
         """检查指定交易对是否处于交易状态"""
         if not self.futures_exchange_info or 'symbols' not in self.futures_exchange_info:
@@ -173,6 +194,17 @@ class BinanceFuturesAPI:
         params = self._order(market, quantity, "SELL")
         return await self._post(path, params)
 
+    async def get_best_bid_ask(self, symbol):
+        path = f"{self.BASE_FAPI_URL_V1}/ticker/bookTicker"
+        params = {"symbol": symbol}
+        response = await self._get_no_sign(path, params)
+        try:
+            best_bid = float(response["bidPrice"])
+            best_ask = float(response["askPrice"])
+            return best_bid, best_ask
+        except KeyError:
+            raise ValueError(f"Failed to retrieve best bid/ask for {symbol}. Response: {response}")
+
     @initial_retry_decorator(retry_count=10, initial_delay=5, max_delay=60, error_handler=email_error_handler,
                              backoff_strategy=exponential_backoff)
     async def set_stop_market_order(self, symbol, side, quantity, stopPrice, closePosition=False):
@@ -198,7 +230,7 @@ class BinanceFuturesAPI:
         path = "%s/ticker/24hr" % self.BASE_FAPI_URL_V1
         return await self._get_no_sign(path)
 
-    async def get_24hr_price_change_ranking(self):
+    async def get_usdt_24hr_price_change_ranking(self):
         try:
             # 获取所有币种的24小时涨跌数据
             data = await self.get_last_24hr_price_change()

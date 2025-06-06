@@ -37,6 +37,27 @@ class BinancePortfolioMarginAPI:
         path = f"{self.BASE_FAPI_URL_V1}/exchangeInfo"
         return await  self._get(path, {})
 
+    async def get_um_max_leverage(self, symbol: str, notional: float = 0.0) -> int:
+        path = f"{self.BASE_PAPI_URL_V1}/um/leverageBracket"
+        response = await self._get(path, {"symbol": symbol})
+        if isinstance(response, dict) and "code" in response:
+            raise RuntimeError(f"API 返回错误: {response}")
+        items = response if isinstance(response, list) else [response]
+        for item in items:
+            if item["symbol"] == symbol:
+                brackets = item["brackets"]
+                if notional == 0:
+                    # 取所有层级中的最大 initialLeverage
+                    return max(int(b["initialLeverage"]) for b in brackets)
+                else:
+                    # 找到对应名义价值所在的层级
+                    for b in brackets:
+                        if b["notionalFloor"] <= notional < b["notionalCap"]:
+                            return int(b["initialLeverage"])
+                    # 如果超过所有区间，则使用最低层
+                    return int(brackets[-1]["initialLeverage"])
+        raise ValueError(f"未找到交易对 {symbol} 的杠杆分层信息")
+
     async def get_server_time(self) -> int:
         """直接返回 Binance 服务器时间，单位毫秒（int类型）"""
         path = "%s/time" % self.BASE_FAPI_URL_V1
@@ -142,6 +163,19 @@ class BinancePortfolioMarginAPI:
         params = {'amount': amount, 'transferSide': transfer_side}
         return await self._post(path, params)
 
+    # await trading.binance_portfolio_margin_api_instance.get_liquidation_price_um("MOVEUSDT")
+    async def get_liquidation_price_um(self, symbol: str) -> float | None:
+        """
+        查询某合约币种当前持仓的爆仓价格（仅适用于 USDT-M futures + Portfolio Margin 模式）
+        """
+        path = f"{self.BASE_PAPI_URL_V1}/um/positionRisk"
+        result = await self._get(path, {})
+        for position in result:
+            if position["symbol"] == symbol:
+                liq_price = position.get("liquidationPrice")
+                return float(liq_price) if liq_price not in ("", None) else None
+        return None  # 没找到该 symbol
+
     @initial_retry_decorator(retry_count=10, initial_delay=1, max_delay=30, error_handler=email_error_handler,
                              backoff_strategy=exponential_backoff)
     async def buy_limit_um(self, symbol, quantity, price):
@@ -176,7 +210,7 @@ class BinancePortfolioMarginAPI:
         path = "%s/um/conditional/order" % self.BASE_PAPI_URL_V1
         formatted_quantity = self._futures_format_quantity(symbol, quantity)
         formatted_stop_price = self._futures_format_price(symbol, stopPrice)
-        params = {"symbol": symbol, "side": side, "strategyType": "STOP_MARKET", "quantity": formatted_quantity,
+        params = {"symbol": symbol, "side": side.upper(), "strategyType": "STOP_MARKET", "quantity": formatted_quantity,
                   "stopPrice": formatted_stop_price}
         return await self._post(path, params)
 
