@@ -109,7 +109,11 @@ class HyperliquidWebsocketManager:
             logging.debug("Websocket not handling empty message")
             return
         for active_subscription in self.active_subscriptions[identifier]:
-            active_subscription.callback(ws_msg)
+            cb = active_subscription.callback
+            if asyncio.iscoroutinefunction(cb):
+                await cb(ws_msg)
+            else:
+                cb(ws_msg)
 
     def on_open(self, _ws):
         logging.debug("on_open")

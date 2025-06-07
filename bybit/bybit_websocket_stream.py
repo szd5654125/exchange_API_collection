@@ -171,10 +171,9 @@ class V5BybitWebSocketManager:
         await self.ws.send(auth_message)
 
     async def _on_message(self, message):
-        # print(f"[接收消息] {message}")
         try:
             message_data = json.loads(message)
-            # 处理ping/pong消息
+            # 处理 ping/pong
             if self._is_custom_pong(message_data):
                 return
             if self._is_custom_ping(message_data):
@@ -200,15 +199,17 @@ class V5BybitWebSocketManager:
                 if not success:
                     print(f"[订阅失败] 原因: {message_data.get('ret_msg')}")
                 return
-            # 处理普通数据消息 (带有topic的)
-            if "topic" in message_data:
-                topic = message_data.get("topic")
-                # 处理消息数据
+            # 有 topic 的情况（标准数据）
+            topic = message_data.get("topic")
+            if topic:
                 self._process_normal_message(message_data)
+                # 查找是否有 callback 注册
+                callback = self.callback_directory.get(topic)
+                if callback and callable(callback):
+                    await callback(message_data)
+                else:
+                    print(f"[警告] 未找到有效回调或回调不可调用: topic={topic}, callback={callback}")
                 return
-            # 调用通用回调处理其他类型消息
-            self.callback(message_data)
-
         except json.JSONDecodeError as e:
             print(f"[JSON解析错误] 消息不是有效的JSON格式: {e}")
         except Exception as e:
@@ -270,6 +271,9 @@ class V5BybitWebSocketManager:
             return False
         # 存储订阅信息
         self.subscriptions[req_id] = subscription_message
+        # 注册回调前，确保 callback 是可调用对象
+        if not callable(callback):
+            raise TypeError(f"[订阅错误] 提供的 callback 不是可调用对象，而是 {type(callback)}")
         # 注册回调
         for formatted_topic in subscription_args:
             self._set_callback(formatted_topic, callback)
