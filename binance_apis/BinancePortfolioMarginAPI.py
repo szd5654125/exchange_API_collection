@@ -37,15 +37,6 @@ class BinancePortfolioMarginAPI:
         path = f"{self.BASE_FAPI_URL_V1}/exchangeInfo"
         return await  self._get(path, {})
 
-    async def get_user_leverage_um(self, symbol: str) -> int:
-        path = f"{self.BASE_PAPI_URL_V1}/um/positionRisk"
-        response = await self._get(path, {})
-
-        for item in response:
-            if item.get("symbol") == symbol:
-                return int(item.get("leverage", 0))  # 返回设置的杠杆倍数
-        raise ValueError(f"未找到 symbol={symbol} 的持仓信息，可能尚未开仓")
-
     async def get_um_max_leverage(self, symbol: str, notional: float = 0.0) -> int:
         path = f"{self.BASE_PAPI_URL_V1}/um/leverageBracket"
         response = await self._get(path, {"symbol": symbol})
@@ -66,6 +57,16 @@ class BinancePortfolioMarginAPI:
                     # 如果超过所有区间，则使用最低层
                     return int(brackets[-1]["initialLeverage"])
         raise ValueError(f"未找到交易对 {symbol} 的杠杆分层信息")
+
+    # 获取某个币种的当前杠杆
+    async def get_current_leverage_um(self, symbol: str) -> int:
+        """获取某个币种当前设置的杠杆倍数"""
+        account_info = await self.get_account_um()
+        positions = account_info.get('positions', [])
+        for pos in positions:
+            if pos.get("symbol") == symbol:
+                return int(pos.get("leverage", 1))  # leverage 字段包含当前杠杆
+        raise ValueError(f"未找到交易对 {symbol} 的持仓信息")
 
     async def set_leverage_um(self, symbol: str, leverage: int):
         path = f"{self.BASE_PAPI_URL_V1}/um/leverage"
