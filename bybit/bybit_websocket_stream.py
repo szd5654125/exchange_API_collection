@@ -24,8 +24,8 @@ TLD_MAIN = "com"
 
 class V5BybitWebSocketManager:
     def __init__(self, callback_function=None, ws_name='main', testnet=False, market_type="linear",
-                 api_key=None, api_secret=None, ping_interval=60, ping_timeout=10,
-                 retries=10, restart_on_error=True, trace_logging=False,
+                 api_key=None, api_secret=None, ping_interval=20, ping_timeout=20,
+                 retries=10, retry_delay = 10, restart_on_error=True, trace_logging=False,
                  private_auth_expire=30, rsa_authentication=False):
         """
         统一的Bybit WebSocket客户端，支持V5 API
@@ -61,9 +61,12 @@ class V5BybitWebSocketManager:
         self.custom_ping_message = json.dumps({"op": "ping"})
         self.custom_pong_message = json.dumps({"op": "pong"})
         self.retries = retries
+        self.retry_delay = retry_delay
         self.handle_error = restart_on_error
         self.data = {}  # 用于存储数据快照
         self.ws = None
+        # 监听消息的事件循环
+        self._auth_event = asyncio.Event()
 
         # 设置WebSocket跟踪日志
         websocket.enableTrace(trace_logging)
@@ -108,47 +111,55 @@ class V5BybitWebSocketManager:
         self.ws = None  # 每次重连时初始化 WebSocket 对象
 
     async def connect(self):
-        """
-        建立WebSocket连接并启动消息循环
-        """
         self.attempting_connection = True
         retries = self.retries
         while retries > 0 and not self.exited:
             try:
-                async with websockets.connect(self.url) as ws:
+                async with websockets.connect(self.url, ping_interval=None, ping_timeout=None, close_timeout=5) as ws:
                     self.ws = ws
-                    # 公共连接直接设置连接事件
                     self._connected_event.set()
                     self.attempting_connection = False
-                    # 发送初始心跳包
                     await self._send_initial_ping()
-                    # 启动心跳任务
                     heartbeat_task = asyncio.create_task(self._send_heartbeat())
-                    # 消息处理循环
-                    async for message in ws:
-                        await self._on_message(message)
-                    # 如果循环退出，表示连接已关闭
-                    print(f"[连接关闭] WebSocket连接已关闭")
+                    message_task = asyncio.create_task(self._message_loop())
+                    if self.api_key:
+                        await self._auth()
+                        if not self.auth:
+                            print("[连接中断] 认证失败")
+                            message_task.cancel()
+                            await message_task
+                            return False
+                    # 重发订阅
+                    for topic, sub in self.subscriptions.items():
+                        try:
+                            msg = {"op": "subscribe", "req_id": str(uuid4()), "args": [topic]}
+                            await self.ws.send(json.dumps(msg))
+                            self._set_callback(topic, sub["callback"])
+                            print(f"[重订阅] 已恢复订阅: {topic}")
+                        except Exception as e:
+                            print(f"[重订阅错误] 发送失败: {e}")
+                    await message_task
+                    print("[连接关闭] WebSocket连接已关闭")
                     self._connected_event.clear()
-                    # 取消心跳任务
                     heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
             except Exception as e:
                 print(f"[连接异常] 发生错误: {e}")
                 import traceback
                 traceback.print_exc()
                 retries -= 1
+                self.ws = None
                 self._connected_event.clear()
                 if self.exited:
                     break
-                # 等待一段时间后重试
-                await asyncio.sleep(self.ping_timeout)
-
+                await asyncio.sleep(self.retry_delay)
         self.attempting_connection = False
-
         if retries <= 0:
             print(f"[连接失败] 达到最大重试次数，无法连接到 {self.url}")
             return False
-
         return True
 
     async def _auth(self):
@@ -169,6 +180,18 @@ class V5BybitWebSocketManager:
         # 构造认证消息
         auth_message = json.dumps({"op": "auth", "args": [self.api_key, expires, signature]})
         await self.ws.send(auth_message)
+        try:
+            await asyncio.wait_for(self._auth_event.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            print("[认证超时] 未收到认证响应")
+            self.auth = False
+
+    async def _message_loop(self):
+        try:
+            async for message in self.ws:
+                await self._on_message(message)
+        except Exception as e:
+            print(f"[消息循环错误] {e}")
 
     async def _on_message(self, message):
         try:
@@ -184,12 +207,14 @@ class V5BybitWebSocketManager:
             # 处理认证响应
             if message_data.get("op") == "auth":
                 success = message_data.get("success", False)
+                self._auth_event.set()  # ✅ 唤醒 _auth()
                 if success:
                     self.auth = True
                     self._connected_event.set()
                 else:
                     print(f"[认证失败] 原因: {message_data.get('ret_msg')}")
                     await self.exit()
+                    self._auth_event.clear()
                     raise Exception(f"认证失败: {message_data.get('ret_msg')}")
                 return
             # 处理订阅响应
@@ -218,11 +243,8 @@ class V5BybitWebSocketManager:
             traceback.print_exc()
 
     async def subscribe(self, topic: str, callback, symbol: (str, list) = False):
-        print(f"[订阅开始] 尝试订阅主题: {topic}, 符号: {symbol}, 对象ID: {id(self)}")
-        # 确保WebSocket已连接
         if not self.is_connected():
             print("[连接检查] WebSocket未连接，尝试建立连接...")
-
             if self.attempting_connection:
                 print("[连接等待] 连接正在进行中，等待完成...")
                 try:
@@ -231,113 +253,72 @@ class V5BybitWebSocketManager:
                     print("[连接超时] 等待连接超时")
                     return False
             else:
-                connection_success = await self.connect()
-                if not connection_success:
+                if not await self.connect():
                     print("[连接失败] 无法建立WebSocket连接")
                     return False
-        if self.api_key:
-            await self._auth()
-        # 准备订阅参数
+
         subscription_args = self._prepare_subscription_args(topic, symbol)
         if not subscription_args:
             print("[订阅错误] 无有效的订阅参数")
             return False
-        # 检查回调是否已注册
+
         self._check_callback_directory(subscription_args)
-        # 生成唯一请求ID
-        req_id = str(uuid4())
-        # 构造订阅消息
-        subscription_message = json.dumps({"op": "subscribe", "req_id": req_id, "args": subscription_args})
-        # 检查连接状态
-        if not self.is_connected():
-            print("[连接检查] WebSocket未连接或已关闭，无法发送订阅请求")
-            return False
-        # 确保已认证(私有主题)
-        if topic in self.standard_private_topics and not self._connected_event.is_set():
-            print("[认证检查] 等待认证完成...")
-            try:
-                await asyncio.wait_for(self._connected_event.wait(), timeout=20)
-                print("[认证完成] 认证已成功完成")
-            except asyncio.TimeoutError:
-                print("[认证超时] 等待认证超时，订阅失败")
-                return False
-        # 发送订阅请求
-        try:
-            await self.ws.send(subscription_message)
-        except Exception as e:
-            print(f"[订阅错误] WebSocket 发送失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-        # 存储订阅信息
-        self.subscriptions[req_id] = subscription_message
-        # 注册回调前，确保 callback 是可调用对象
-        if not callable(callback):
-            raise TypeError(f"[订阅错误] 提供的 callback 不是可调用对象，而是 {type(callback)}")
-        # 注册回调
+
         for formatted_topic in subscription_args:
+            msg = {
+                "op": "subscribe",
+                "req_id": str(uuid4()),
+                "args": [formatted_topic],
+            }
+            try:
+                await self.ws.send(json.dumps(msg))
+            except Exception as e:
+                print(f"[订阅错误] WebSocket发送失败: {e}")
+                import traceback
+                traceback.print_exc()
+                return False
+
+            # 记录结构化订阅信息
+            self.subscriptions[formatted_topic] = {
+                "topic": formatted_topic,
+                "symbol": symbol,
+                "op": "subscribe",
+                "callback": callback,
+            }
+
             self._set_callback(formatted_topic, callback)
+
         return True
 
     async def unsubscribe(self, topic: str, symbol: (str, list) = False):
-        """
-        取消订阅WebSocket主题
-
-        Args:
-            topic: 主题名称
-            symbol: 交易对名称，可以是字符串或字符串列表，对于私有主题可以为False
-
-        Returns:
-            bool: 取消订阅是否成功
-        """
-        # 准备取消订阅的参数
         unsubscription_args = self._prepare_subscription_args(topic, symbol)
-
         if not unsubscription_args:
             print("[取消订阅错误] 无有效的取消订阅参数")
             return False
 
-        # 查找要取消的订阅
-        req_id_to_remove = None
-        for req_id, message in list(self.subscriptions.items()):
-            message_data = json.loads(message)
-            if any(arg in message_data.get("args", []) for arg in unsubscription_args):
-                req_id_to_remove = req_id
-                break
+        for formatted_topic in unsubscription_args:
+            if formatted_topic not in self.subscriptions:
+                print(f"[取消订阅警告] 未找到订阅: {formatted_topic}")
+                continue
 
-        if not req_id_to_remove:
-            print(f"[取消订阅警告] 未找到订阅: {unsubscription_args}")
-            return False
+            msg = {
+                "op": "unsubscribe",
+                "req_id": str(uuid4()),
+                "args": [formatted_topic],
+            }
 
-        # 构造取消订阅消息
-        unsubscribe_message = json.dumps({
-            "op": "unsubscribe",
-            "req_id": req_id_to_remove,
-            "args": unsubscription_args
-        })
-
-        # 发送取消订阅请求
-        try:
-            if self.is_connected():
-                await self.ws.send(unsubscribe_message)
-                print(f"[取消订阅] 成功发送: {unsubscription_args}")
-
-                # 从订阅列表中移除
-                self.subscriptions.pop(req_id_to_remove, None)
-
-                # 移除回调
-                for topic in unsubscription_args:
-                    self.callback_directory.pop(topic, None)
-
-                return True
-            else:
-                print("[取消订阅错误] WebSocket未连接，无法发送请求")
+            try:
+                await self.ws.send(json.dumps(msg))
+                print(f"[取消订阅] 成功发送: {formatted_topic}")
+                self.subscriptions.pop(formatted_topic, None)
+                self.callback_directory.pop(formatted_topic, None)
+            except Exception as e:
+                print(f"[取消订阅错误] WebSocket发送失败: {e}")
+                import traceback
+                traceback.print_exc()
                 return False
-        except Exception as e:
-            print(f"[取消订阅错误] WebSocket 发送失败: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
+
+        return True
 
     def _prepare_subscription_args(self, topic, symbol):
         # 处理私有主题
@@ -366,6 +347,10 @@ class V5BybitWebSocketManager:
     async def _send_heartbeat(self):
         try:
             while not self.exited:
+                if not self.auth and self.api_key:
+                    print("[心跳] 跳过未认证状态的心跳")
+                    await asyncio.sleep(self.ping_interval)
+                    continue
                 try:
                     if self.is_connected():
                         await self._send_custom_ping()
