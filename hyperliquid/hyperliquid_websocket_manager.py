@@ -1,5 +1,6 @@
 import json
 import logging
+import traceback
 from collections import defaultdict
 import asyncio
 import websockets
@@ -17,19 +18,27 @@ class HyperliquidWebsocketManager:
         self.ws_url = "wss://" + MAINNET_API_URL.removeprefix("https://").removeprefix("http://") + "/ws"
         self.subscription_id_counter = 0
         self.ws_ready = asyncio.Event()
+        self._subscriptions_cfg = {}
         self.queued_subscriptions = []
         self.active_subscriptions = defaultdict(list)
         self.stop_event = asyncio.Event()
         self.ws = None  # type: Optional[websockets.WebSocketClientProtocol]
 
     async def connect(self):
+        retry_delay = 5  # 初始重连延迟（秒）
         while not self.stop_event.is_set():
             self.ws_ready.clear()  # 连接断开或未建立时，标志未就绪
             self.ws = None
             try:
-                async with websockets.connect(self.ws_url) as websocket:
+                # 禁用控制帧，自己发业务ping
+                async with websockets.connect(self.ws_url, ping_interval=None, open_timeout=30) as websocket:
                     self.ws = websocket
+                    # ---------- ① 先补发历史订阅 ----------
+                    for sub in self._subscriptions_cfg.values():
+                        await websocket.send(json.dumps({"method": "subscribe", "subscription": sub}))
                     self.ws_ready.set()  # 连接并认证成功后设置就绪标志
+                    retry_delay = 10  # 成功连接后重置重试时间
+                    # 处理断线期间的排队订阅
                     if self.queued_subscriptions:
                         print(
                             f"[{asyncio.current_task().get_name()}] 处理 {len(self.queued_subscriptions)} 个排队订阅...")
@@ -41,17 +50,16 @@ class HyperliquidWebsocketManager:
                                                  active_subscription.subscription_id)
                         print(f"[{asyncio.current_task().get_name()}] 排队订阅处理完毕。")
                     ping_task = asyncio.create_task(self.send_ping())
-
                     # --- 核心消息接收循环 ---
                     try:
                         async for message in websocket:
                             await self.on_message(message)
                     except websockets.exceptions.ConnectionClosed as e:
                         logging.warning(f"[{asyncio.current_task().get_name()}] WebSocket connection closed: {e}")
+                        logging.debug(traceback.format_exc())
                     except Exception as e:
                         logging.error(f"[{asyncio.current_task().get_name()}] WebSocket 消息处理异常: {e}",
                                       exc_info=True)
-
                     finally:
                         # 连接断开或异常，进行清理
                         print(f"[{asyncio.current_task().get_name()}] Hyperliquid WebSocket 连接关闭，进行清理...")
@@ -72,7 +80,8 @@ class HyperliquidWebsocketManager:
             # --- 重连延迟 ---
             if not self.stop_event.is_set():
                 print(f"[{asyncio.current_task().get_name()}] 等待 5 秒后尝试重连...")
-                await asyncio.sleep(5)  # 等待一段时间再重连
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 300)
 
         print(f"[{asyncio.current_task().get_name()}] Hyperliquid 连接管理协程停止。")
 
@@ -131,6 +140,7 @@ class HyperliquidWebsocketManager:
             raise NotImplementedError(f"Cannot subscribe to {identifier} multiple times")
 
         self.active_subscriptions[identifier].append(ActiveSubscription(callback, subscription_id))
+        self._subscriptions_cfg[subscription_id] = subscription
         await self.ws.send(json.dumps({
             "method": "subscribe",
             "subscription": subscription
@@ -142,7 +152,8 @@ class HyperliquidWebsocketManager:
         subs = self.active_subscriptions[identifier]
         new_subs = [s for s in subs if s.subscription_id != subscription_id]
         self.active_subscriptions[identifier] = new_subs
-        if not new_subs:
+        self._subscriptions_cfg.pop(subscription_id, None)
+        if not new_subs and self.ws_ready.is_set():
             await self.ws.send(json.dumps({"method": "unsubscribe", "subscription": subscription}))
         return len(subs) != len(new_subs)
 

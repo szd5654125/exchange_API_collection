@@ -62,15 +62,14 @@ class Exchange(API):
 
     def slippage_price(
             self,
-            name: str,
+            coin: str,
             is_buy: bool,
             slippage: float,
             px: Optional[float] = None,
     ) -> float:
-        coin = self.info.name_to_coin[name]
         if not px:
             # Get midprice
-            px = float(self.info.all_mids()[coin])
+            px = float(self.info.get_price(coin, self.info.all_mids()))
 
         asset = self.info.coin_to_asset[coin]
         # spot assets start at 10000
