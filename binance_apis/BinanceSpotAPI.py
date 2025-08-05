@@ -47,7 +47,6 @@ class BinanceSpotAPI:
     # 获取特定币种特点网络的存钱地址
     async def get_deposit_address_by_network(self, coin: str, network: str = None) -> str:
         result = await self.get_network_depositable(coin, network)
-        print(result)
         address = result.get('address')
         return address
 
