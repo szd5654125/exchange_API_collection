@@ -15,24 +15,25 @@ class BinanceFuturesAPI:
     BASE_FAPI_URL_V2 = "https://fapi.binance.com/fapi/v2"
     BASE_FAPI_URL_V3 = "https://fapi.binance.com/fapi/v3"
 
-    def __init__(self, key, secret, futures_exchange_info=None, multi_assets_margin="true"):
+    def __init__(self, key, secret, symbol=None, futures_exchange_info=None, multi_assets_margin="true"):
         self.key = key
         self.secret = secret
         self.futures_exchange_info = futures_exchange_info  # 由 create 方法注入
+        self.symbol = symbol
 
         if multi_assets_margin not in ["true", "false"]:
             raise ValueError("margin_mode must be 'true' or 'false'.")
         self.multi_assets_margin = multi_assets_margin
 
     @classmethod
-    async def create(cls, key, secret, multi_assets_margin="true"):
-        self = cls(key, secret, multi_assets_margin=multi_assets_margin)
+    async def create(cls, key, secret, symbol=None, multi_assets_margin="true"):
+        self = cls(key, secret, symbol, multi_assets_margin=multi_assets_margin)
         self.futures_exchange_info = await self.get_futures_exchange_info()
         return self
 
     async def get_futures_exchange_info(self):
         path = f"{self.BASE_FAPI_URL_V1}/exchangeInfo"
-        return await  self._get(path, {})
+        return await self._get(path, {})
 
     @initial_retry_decorator(retry_count=10, initial_delay=1, max_delay=30, error_handler=log_error_handler,
                              backoff_strategy=exponential_backoff)
@@ -135,6 +136,14 @@ class BinanceFuturesAPI:
                     # 如果超过所有区间，则使用最低层
                     return int(brackets[-1]["initialLeverage"])
         raise ValueError(f"未找到交易对 {symbol} 的杠杆分层信息")
+
+    async def set_leverage(self, symbol: str, leverage: int):
+        path = f"{self.BASE_FAPI_URL_V1}/leverage"
+        params = {
+            "symbol": symbol,
+            "leverage": leverage
+        }
+        return await self._post(path, params)
 
     def check_if_um_future_trading(self, symbol):
         """检查指定交易对是否处于交易状态"""

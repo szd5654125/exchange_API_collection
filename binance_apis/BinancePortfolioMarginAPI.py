@@ -37,6 +37,15 @@ class BinancePortfolioMarginAPI:
         path = f"{self.BASE_FAPI_URL_V1}/exchangeInfo"
         return await  self._get(path, {})
 
+    async def get_user_leverage_um(self, symbol: str) -> int:
+        path = f"{self.BASE_PAPI_URL_V1}/um/positionRisk"
+        response = await self._get(path, {})
+
+        for item in response:
+            if item.get("symbol") == symbol:
+                return int(item.get("leverage", 0))  # 返回设置的杠杆倍数
+        raise ValueError(f"未找到 symbol={symbol} 的持仓信息，可能尚未开仓")
+
     async def get_um_max_leverage(self, symbol: str, notional: float = 0.0) -> int:
         path = f"{self.BASE_PAPI_URL_V1}/um/leverageBracket"
         response = await self._get(path, {"symbol": symbol})
@@ -57,6 +66,14 @@ class BinancePortfolioMarginAPI:
                     # 如果超过所有区间，则使用最低层
                     return int(brackets[-1]["initialLeverage"])
         raise ValueError(f"未找到交易对 {symbol} 的杠杆分层信息")
+
+    async def set_leverage_um(self, symbol: str, leverage: int):
+        path = f"{self.BASE_PAPI_URL_V1}/um/leverage"
+        params = {
+            "symbol": symbol,
+            "leverage": leverage
+        }
+        return await self._post(path, params)
 
     async def get_server_time(self) -> int:
         """直接返回 Binance 服务器时间，单位毫秒（int类型）"""
@@ -141,9 +158,9 @@ class BinancePortfolioMarginAPI:
         positions = account_info.get('positions', [])
 
         total_symbol_amt = 0.0  # 累加所有相同符号的仓位
-        for symbol in positions:
-            if symbol.get("symbol") == symbol:
-                total_symbol_amt += float(symbol.get("positionAmt"))
+        for pos in positions:
+            if pos.get("symbol") == symbol:
+                total_symbol_amt += float(pos.get("positionAmt"))
         return total_symbol_amt
 
     async def get_asset_amount_um(self, symbol):
