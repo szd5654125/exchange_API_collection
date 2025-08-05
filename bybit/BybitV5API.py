@@ -458,8 +458,8 @@ class BybitV5API:
     # print(bit.buy_limit('linear','FILUSDT', 5, 2.4))
     async def buy_limit(self, category, symbol, quantity, price):
         # 当前仅对合约调整了精度
-        price = self.adjust_price_to_tick(category, symbol, price)
-        quantity = self.adjust_qty_to_step(category, symbol, quantity)
+        price = await self.adjust_price_to_tick(category, symbol, price)
+        quantity = await self.adjust_qty_to_step(category, symbol, quantity)
         return await self._request(
             auth=True,
             method="POST",
@@ -476,8 +476,8 @@ class BybitV5API:
 
     async def sell_limit(self, category, symbol, quantity, price):
         # 当前仅对合约调整了精度
-        price = self.adjust_price_to_tick(category, symbol, price)
-        quantity = self.adjust_qty_to_step(category, symbol, quantity)
+        price = await self.adjust_price_to_tick(category, symbol, price)
+        quantity = await self.adjust_qty_to_step(category, symbol, quantity)
         return await self._request(
             auth=True,
             method="POST",
@@ -495,7 +495,7 @@ class BybitV5API:
     # 注意：bybit下超过余额的单会报错（但是因为bybit杠杠比hyperliquid高很多，所以一般没关系）
     # print(bit.buy_market('linear', 'FILUSDT', 5))
     async def buy_market(self, category, symbol, quantity):
-        quantity = self.adjust_qty_to_step(category, symbol, quantity)
+        quantity = await self.adjust_qty_to_step(category, symbol, quantity)
         return await self._request(
             auth=True,
             method="POST",
@@ -511,7 +511,7 @@ class BybitV5API:
 
     # print(bit.sell_market('FILUSDT', 5, 'linear'))
     async def sell_market(self, category, symbol, quantity):
-        quantity = self.adjust_qty_to_step(category, symbol, quantity)
+        quantity = await self.adjust_qty_to_step(category, symbol, quantity)
         return await self._request(
             auth=True,
             method="POST",
@@ -607,9 +607,9 @@ class BybitV5API:
         """
         # 当前仅对合约调整了精度
         if takeProfit:
-            takeProfit = self.adjust_price_to_tick(category, symbol, float(takeProfit))
+            takeProfit = await self.adjust_price_to_tick(category, symbol, float(takeProfit))
         if stopLoss:
-            stopLoss = self.adjust_price_to_tick(category, symbol, float(stopLoss))
+            stopLoss = await self.adjust_price_to_tick(category, symbol, float(stopLoss))
         return await self._request(  # 注意加 await
             auth=True,
             method="POST",
@@ -626,7 +626,7 @@ class BybitV5API:
     # print(bit.asset_withdraw('USDT', 'BSC', '0xf663dded85cf7d1e9af810ce952ca4004fe772c9', 10))
     # 提币地址必须在地址簿中
     async def asset_withdraw(self, coin, chain, address, amount, force_chain=1):
-        amount = self.adjust_qty_to_step('spot', f'{coin}USDT', amount)
+        amount = await self.adjust_qty_to_step('spot', f'{coin}USDT', amount)
         payload = {
             "coin": coin.upper(),
             "chain": chain,
@@ -696,7 +696,7 @@ class BybitV5API:
     async def asset_transfer(self, coin, amount, fromAccountType, toAccountType):
         # 避免0转账引起错误
         if amount >= 0:
-            amount = self.adjust_qty_to_step('spot', f'{coin}USDT', amount)
+            amount = await self.adjust_qty_to_step('spot', f'{coin}USDT', amount)
             return await self._request(
                 auth=True,
                 method="POST",
@@ -924,12 +924,35 @@ class BybitV5API:
             else:
                 return s_json
 
-    miss_info = [
-        {'category': 'linear', 'symbol': 'VVVUSDT', 'tick_size': Decimal('0.001'), 'qty_step': Decimal('0.01')},
-        {'category': 'linear', 'symbol': 'WCTUSDT', 'tick_size': Decimal('0.00001'), 'qty_step': Decimal('1')}
-    ]
+    def calculate_size_and_step(self, prices_or_qty) -> str:
+        max_decimal_places = 0
+        for i in prices_or_qty:
+            if i and i != '0' and i != '':
+                prices_or_qty_str = str(i).strip()
+                if '.' in prices_or_qty_str:
+                    decimal_part = prices_or_qty_str.split('.')[1].rstrip('0')
+                    if decimal_part:
+                        decimal_places = len(decimal_part)
+                        max_decimal_places = max(max_decimal_places, decimal_places)
+        # 统一用一个公式处理所有情况
+        if max_decimal_places == 0:
+            return "1"
+        else:
+            return f"0.{'0' * (max_decimal_places - 1)}1"
 
-    def adjust_price_to_tick(self, category: str, symbol: str, price: float) -> float:
+    def analyze_bybit_data(self, data_dict: dict, price_or_qty) -> str:
+        if 'result' in data_dict and 'list' in data_dict['result'] and len(data_dict['result']['list']) > 0:
+            item = data_dict['result']['list'][0]
+            if price_or_qty == 'price':
+                # 提取指定的价格字段
+                prices = [item.get('highPrice24h', ''), item.get('lowPrice24h', ''), item.get('prevPrice1h', ''),
+                    item.get('bid1Price', ''), item.get('ask1Price', '')]
+                return self.calculate_size_and_step(prices)
+            else:
+                qty = [item.get('volume24h', ''), item.get('ask1Size', ''), item.get('bid1Size', '')]
+                return self.calculate_size_and_step(qty)
+
+    async def adjust_price_to_tick(self, category: str, symbol: str, price: float) -> float:
         if category == "spot":
             for item in self.spot_exchange_info["result"]["list"]:
                 if item["symbol"] == symbol:
@@ -939,12 +962,6 @@ class BybitV5API:
                     # 使用整除来调整价格到最接近的精度
                     adjusted_price = (price_decimal // tick_size) * tick_size
                     return float(adjusted_price.quantize(tick_size, rounding=ROUND_DOWN))
-            for item in self.miss_info:
-                if item["symbol"] == symbol:
-                    tick_size = item['tick_size']
-                    price_decimal = Decimal(str(price))
-                    adjusted_price = (price_decimal // tick_size) * tick_size
-                    return float(adjusted_price.quantize(tick_size, rounding=ROUND_DOWN))
         if category == "linear":
             for item in self.linear_exchange_info["result"]["list"]:
                 if item["symbol"] == symbol:
@@ -952,15 +969,13 @@ class BybitV5API:
                     price_decimal = Decimal(str(price))
                     adjusted_price = (price_decimal // tick_size) * tick_size
                     return float(adjusted_price.quantize(tick_size, rounding=ROUND_DOWN))
-            for item in self.miss_info:
-                if item["symbol"] == symbol:
-                    tick_size = item['tick_size']
-                    price_decimal = Decimal(str(price))
-                    adjusted_price = (price_decimal // tick_size) * tick_size
-                    return float(adjusted_price.quantize(tick_size, rounding=ROUND_DOWN))
-        raise ValueError(f"找不到 symbol: {symbol} 的价格精度信息")
+        last_tick = await self.last_price(category, symbol)
+        tick_size = Decimal(self.analyze_bybit_data(last_tick, 'price'))
+        price_decimal = Decimal(str(price))
+        adjusted_price = (price_decimal // tick_size) * tick_size
+        return float(adjusted_price.quantize(tick_size, rounding=ROUND_DOWN))
 
-    def adjust_qty_to_step(self, category: str, symbol: str, qty: float) -> float:
+    async def adjust_qty_to_step(self, category: str, symbol: str, qty: float) -> float:
         if category == "spot":
             for item in self.spot_exchange_info["result"]["list"]:
                 if item["symbol"] == symbol:
@@ -970,12 +985,6 @@ class BybitV5API:
                     # 计算调整后的数量
                     adjusted_qty = (qty_decimal // qty_step) * qty_step
                     return float(adjusted_qty.quantize(qty_step, rounding=ROUND_DOWN))
-            for item in self.miss_info:
-                if item["symbol"] == symbol:
-                    qty_step = item['qty_step']
-                    qty_decimal = Decimal(str(qty))
-                    adjusted_qty = (qty_decimal // qty_step) * qty_step
-                    return float(adjusted_qty.quantize(qty_step, rounding=ROUND_DOWN))
         if category == "linear":
             for item in self.linear_exchange_info["result"]["list"]:
                 if item["symbol"] == symbol:
@@ -983,11 +992,9 @@ class BybitV5API:
                     qty_decimal = Decimal(str(qty))
                     adjusted_qty = (qty_decimal // qty_step) * qty_step
                     return float(adjusted_qty.quantize(qty_step, rounding=ROUND_DOWN))
-            for item in self.miss_info:
-                if item["symbol"] == symbol:
-                    qty_step = item['qty_step']
-                    qty_decimal = Decimal(str(qty))
-                    adjusted_qty = (qty_decimal // qty_step) * qty_step
-                    return float(adjusted_qty.quantize(qty_step, rounding=ROUND_DOWN))
-        raise ValueError(f"找不到 {category} symbol: {symbol} 的数量精度信息")
+        last_tick = await self.last_price(category, symbol)
+        tick_size = Decimal(self.analyze_bybit_data(last_tick, 'qty'))
+        qty_decimal = Decimal(str(qty))
+        adjusted_price = (qty_decimal // tick_size) * tick_size
+        return float(adjusted_price.quantize(tick_size, rounding=ROUND_DOWN))
 
