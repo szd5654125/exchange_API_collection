@@ -70,7 +70,6 @@ class OnchainUtils:
             await asyncio.sleep(delay_sec)
             current_balance_wei = self.usdc_contract.functions.balanceOf(self.wallet_address).call()
             current_balance = current_balance_wei / 1e6
-            print(f"⏳ 当前余额：{current_balance} USDC（目标：{except_usdc_amount}）")
             if current_balance >= except_usdc_amount:
                 print(f"✅ 检测到余额为 {current_balance} USDC，符合预期！")
                 return True
