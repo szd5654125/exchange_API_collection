@@ -308,30 +308,17 @@ class BinanceFuturesAPI:
         return float(data["quoteVolume"])
 
     async def get_usdt_24hr_price_change_ranking(self):
-        try:
-            # 获取所有币种的24小时涨跌数据
-            data = await self.get_last_24hr_price_change()
-            # 过滤出 USDT 合约（可根据你需求定制，比如 endswith('USDT')）
-            usdt_symbols = [item for item in data if item['symbol'].endswith('USDT')]
-            # 构建排序列表，包含 symbol 和涨幅百分比（转 float）
-            ranked_list = sorted(
-                [
-                    {
-                        'symbol': item['symbol'],
-                        'priceChangePercent': float(item['priceChangePercent']),
-                        'lastPrice': float(item['lastPrice']),
-                        'volume': float(item['volume']),
-                        'quoteVolume': float(item['quoteVolume']),
-                    }
-                    for item in usdt_symbols
-                ],
-                key=lambda x: x['priceChangePercent'],
-                reverse=True  # 最大涨幅在前
-            )
-            return ranked_list
-        except Exception as e:
-            print(f"获取24小时涨跌幅数据失败: {e}")
-            return []
+        # 获取所有币种的24小时涨跌数据
+        data = await self.get_last_24hr_price_change()
+        # 过滤出 USDT 合约（可根据你需求定制，比如 endswith('USDT')）
+        usdt_symbols = [item for item in data if item['symbol'].endswith('USDT')]
+        # 构建排序列表，包含 symbol 和涨幅百分比（转 float）
+        ranked_list = sorted(
+            [{'symbol': item['symbol'], 'priceChangePercent': float(item['priceChangePercent']),
+              'lastPrice': float(item['lastPrice']), 'volume': float(item['volume']),
+              'quoteVolume': float(item['quoteVolume']), } for item in usdt_symbols],
+            key=lambda x: x['priceChangePercent'], reverse=True)
+        return ranked_list
 
     @initial_retry_decorator(retry_count=10, initial_delay=5, max_delay=60, error_handler=email_error_handler,
                              backoff_strategy=exponential_backoff)
@@ -373,11 +360,10 @@ class BinanceFuturesAPI:
         return await self._delete(path, params)
 
     async def _get_no_sign(self, path, params=None):
-        query = urlencode(params)
-        url = "%s?%s" % (path, query)
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=30, ssl=True) as response:
-                return await response.json()
+            async with session.get(path, params=params or {}, timeout=30, ssl=True) as resp:
+                resp.raise_for_status()
+                return await resp.json()
 
     async def _sign(self, params):
         data = params.copy()
