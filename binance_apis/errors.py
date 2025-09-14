@@ -1,0 +1,2 @@
+class SymbolClosedError(RuntimeError):
+    pass

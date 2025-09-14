@@ -2,7 +2,7 @@ import time
 import hashlib
 import hmac
 import asyncio
-from utils import config
+from utils.utils import config
 import aiohttp
 from urllib.parse import urlencode
 from warning_error_handlers import (initial_retry_decorator, infinite_retry_decorator, exponential_backoff,

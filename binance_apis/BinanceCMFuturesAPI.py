@@ -2,7 +2,7 @@ import time
 import hashlib
 import requests
 import hmac
-from utils import config
+from utils.utils import config
 import aiohttp
 from urllib.parse import urlencode
 

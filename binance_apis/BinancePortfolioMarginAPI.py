@@ -1,16 +1,16 @@
 import time
 from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
-
 import requests
 import hashlib
 import hmac
-from utils import config
+from utils.utils import config
 import aiohttp
 from urllib.parse import urlencode
 from warning_error_handlers import initial_retry_decorator, email_error_handler, log_error_handler, exponential_backoff
+from binance_apis.errors import SymbolClosedError
 
 
-async def _get_no_sign(path, params={}):
+async def _get_no_sign(path, params):
     query = urlencode(params)
     url = "%s?%s" % (path, query)
     async with aiohttp.ClientSession() as session:
@@ -35,12 +35,37 @@ class BinancePortfolioMarginAPI:
 
     async def get_futures_exchange_info(self):
         path = f"{self.BASE_FAPI_URL_V1}/exchangeInfo"
-        return await  self._get(path, {})
+        return await self._get(path, {})
+
+    def _get_symbol_filters(self, symbol):
+        for s in self.futures_exchange_info["symbols"]:
+            if s["symbol"] == symbol:
+                return {f["filterType"]: f for f in s["filters"]}
+        raise ValueError(f"filters not found for {symbol}")
+
+    def market_lot_limits(self, symbol):
+        f = self._get_symbol_filters(symbol).get("MARKET_LOT_SIZE")
+        if not f:
+            raise ValueError(f"MARKET_LOT_SIZE not found for {symbol}")
+        return float(f["minQty"]), float(f["maxQty"]), float(f["stepSize"])
+
+    def lot_limits(self, symbol):
+        f = self._get_symbol_filters(symbol).get("LOT_SIZE")
+        if not f:
+            raise ValueError(f"LOT_SIZE not found for {symbol}")
+        return float(f["minQty"]), float(f["maxQty"]), float(f["stepSize"])
+
+    def _max_position_limit(self, symbol):
+        f = self._get_symbol_filters(symbol).get("MAX_POSITION")
+        return float(f["maxPosition"]) if f and "maxPosition" in f else None
 
     async def get_um_max_leverage(self, symbol: str, notional: float = 0.0) -> int:
         path = f"{self.BASE_PAPI_URL_V1}/um/leverageBracket"
         response = await self._get(path, {"symbol": symbol})
-        if isinstance(response, dict) and "code" in response:
+        if isinstance(response, dict) and response.get("code") == -4141:
+            # 明确告诉上层：这个是不可恢复的“品种关闭”
+            raise SymbolClosedError(f"Symbol closed: {symbol} (code=-4141)")
+        if "error" in response:
             raise RuntimeError(f"API 返回错误: {response}")
         items = response if isinstance(response, list) else [response]
         for item in items:
@@ -196,38 +221,94 @@ class BinancePortfolioMarginAPI:
 
     @initial_retry_decorator(retry_count=10, initial_delay=1, max_delay=30, error_handler=email_error_handler,
                              backoff_strategy=exponential_backoff)
-    async def buy_limit_um(self, symbol, quantity, price):
+    async def buy_limit_um(self, symbol, quantity, price, client_order_id=None):
         path = "%s/um/order" % self.BASE_PAPI_URL_V1
         params = self._order(symbol, quantity, "BUY", price)
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         return await self._post(path, params)
 
     @initial_retry_decorator(retry_count=10, initial_delay=1, max_delay=30, error_handler=email_error_handler,
                              backoff_strategy=exponential_backoff)
-    async def sell_limit_um(self, symbol, quantity, price):
+    async def sell_limit_um(self, symbol, quantity, price, client_order_id=None):
         path = "%s/um/order" % self.BASE_PAPI_URL_V1
         params = self._order(symbol, quantity, "SELL", price)
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         return await self._post(path, params)
 
-    @initial_retry_decorator(retry_count=10, initial_delay=1, max_delay=30, error_handler=email_error_handler,
-                             backoff_strategy=exponential_backoff)
+    async def _cap_qty_for_market(self, symbol, qty):
+        min_q, max_q, step = self.market_lot_limits(symbol)
+        cap = min(float(qty), max_q)  # 只向下截到 max，不做步进
+        max_pos = self._max_position_limit(symbol)
+        if max_pos is not None:
+            cur = await self.get_position_amount_um(symbol)  # signed
+            allow = max(0.0, max_pos - abs(cur))  # 账户剩余额度
+            cap = min(cap, allow)
+        if cap < min_q:
+            # 不强行把 cap 提到 min_q，避免“超买”。由上层决定是否继续/放弃。
+            return 0.0, {"minQty": min_q, "maxQty": max_q, "step": step, "maxPosition": max_pos}
+        return cap, {"minQty": min_q, "maxQty": max_q, "step": step, "maxPosition": max_pos}
+
+    async def _market_order_split(self, symbol, side, quantity):
+        filled = 0.0
+        last_resp = None
+        remain = float(quantity)
+        # 防御性：避免极端情况下死循环
+        max_loops = 100
+        while remain > 0 and max_loops > 0:
+            max_loops -= 1
+            cap_req, meta = await self._cap_qty_for_market(symbol, remain)
+            if cap_req <= 0:
+                if filled == 0.0:
+                    # 达到持仓最大值
+                    break
+            cap_fmt = self.futures_format_quantity_market(symbol, cap_req)
+            # 落格后如果 < minQty，同样按“是否已有成交”处理
+            if cap_fmt < meta["minQty"]:
+                if filled == 0.0:
+                    return {"code": -4005, "msg": "Formatted quantity < minQty",
+                            "meta": {**meta, "requestedQty": quantity, "filledQty": filled, "remain": remain,
+                                     "capReq": cap_req}}
+                else:
+                    break
+            # 3) 发送本笔
+            params = self._order(symbol, cap_fmt, side)  # MARKET
+            last_resp = await self._post(f"{self.BASE_PAPI_URL_V1}/um/order", params)
+
+            # 交易所返回负码，原样抛给上层；若已部分成交，也把上下文带回去
+            if isinstance(last_resp, dict) and last_resp.get("code", 0) < 0:
+                if filled > 0.0:
+                    last_resp.setdefault("meta", {})
+                    last_resp["meta"].update({"requestedQty": quantity, "filledQty": filled, "lastTryCapReq": cap_req,
+                                              "lastTryCapFmt": cap_fmt, **meta})
+                return last_resp
+            filled += cap_fmt
+            remain -= cap_fmt
+
+        # 给一个统一的 meta，标注是否部分成交
+        result = last_resp if isinstance(last_resp, dict) else {"code": 0, "data": last_resp}
+        result.setdefault("meta", {})
+        result["meta"].update({"requestedQty": quantity, "filledQty": filled, "remainderDropped": max(0.0, remain),
+                               "partialFilled": filled < quantity})
+        return result
+
+    @initial_retry_decorator(retry_count=10, initial_delay=1, max_delay=30,
+                             error_handler=email_error_handler, backoff_strategy=exponential_backoff)
     async def buy_market_um(self, symbol, quantity):
-        path = f"{self.BASE_PAPI_URL_V1}/um/order"
-        params = self._order(symbol, quantity, "BUY")
-        return await self._post(path, params)
+        return await self._market_order_split(symbol, "BUY", quantity)
 
-    @initial_retry_decorator(retry_count=10, initial_delay=1, max_delay=30, error_handler=email_error_handler,
-                             backoff_strategy=exponential_backoff)
+    @initial_retry_decorator(retry_count=10, initial_delay=1, max_delay=30,
+                             error_handler=email_error_handler, backoff_strategy=exponential_backoff)
     async def sell_market_um(self, symbol, quantity):
-        path = f"{self.BASE_PAPI_URL_V1}/um/order"
-        params = self._order(symbol, quantity, "SELL")
-        return await self._post(path, params)
+        return await self._market_order_split(symbol, "SELL", quantity)
 
     @initial_retry_decorator(retry_count=10, initial_delay=5, max_delay=60, error_handler=email_error_handler,
                              backoff_strategy=exponential_backoff)
     async def set_stop_market_order_um(self, symbol, side, quantity, stopPrice):
-        path = "%s/um/conditional/order" % self.BASE_PAPI_URL_V1
-        formatted_quantity = self._futures_format_quantity(symbol, quantity)
-        formatted_stop_price = self._futures_format_price(symbol, stopPrice)
+        path = f"{self.BASE_PAPI_URL_V1}/um/conditional/order"
+        formatted_quantity = self.futures_format_quantity_market(symbol, quantity)
+        formatted_stop_price = self.futures_format_price(symbol, stopPrice)
         params = {"symbol": symbol, "side": side.upper(), "strategyType": "STOP_MARKET", "quantity": formatted_quantity,
                   "stopPrice": formatted_stop_price}
         return await self._post(path, params)
@@ -235,9 +316,13 @@ class BinancePortfolioMarginAPI:
     # 撤销um特定交易对订单
     @initial_retry_decorator(retry_count=10, initial_delay=5, max_delay=60, error_handler=email_error_handler,
                              backoff_strategy=exponential_backoff)
-    async def cancel_orders_um(self, symbol, orderId):
+    async def cancel_orders_um(self, symbol, order_id=None, client_order_id=None):
         path = f"{self.BASE_PAPI_URL_V1}/um/order"
-        params = {"symbol": symbol, "orderId": orderId}
+        params = {"symbol": symbol}
+        if order_id:
+            params["orderId"] = order_id
+        if client_order_id:
+            params["origClientOrderId"] = client_order_id
         return await self._delete(path, params)
 
     @initial_retry_decorator(retry_count=10, initial_delay=5, max_delay=60, error_handler=email_error_handler,
@@ -254,7 +339,7 @@ class BinancePortfolioMarginAPI:
         params = {"symbol": symbol}
         return await self._delete(path, params)
 
-    async def _sign(self, params={}):
+    async def _sign(self, params):
         data = params.copy()
 
         ts = await self.get_server_time()
@@ -266,7 +351,7 @@ class BinancePortfolioMarginAPI:
         data.update({"signature": signature})
         return data
 
-    def _sign_sync(self, params={}):
+    def _sign_sync(self, params):
         data = params.copy()
         ts = int(1000 * time.time())
         data.update({"timestamp": ts})
@@ -277,7 +362,7 @@ class BinancePortfolioMarginAPI:
         data.update({"signature": signature})
         return data
 
-    async def _get(self, path, params={}):
+    async def _get(self, path, params):
         params.update({"recvWindow": config['recv_window']})
         query = urlencode(await self._sign(params))
         url = f"{path}?{query}"
@@ -288,7 +373,7 @@ class BinancePortfolioMarginAPI:
             async with session.get(url, headers=headers, ssl=True) as response:
                 return await response.json()
 
-    def _get_sync(self, path, params={}):
+    def _get_sync(self, path, params):
         params.update({"recvWindow": config['recv_window']})
         query = urlencode(self._sign_sync(params))
         url = f"{path}?{query}"
@@ -297,7 +382,7 @@ class BinancePortfolioMarginAPI:
         response.raise_for_status()
         return response.json()
 
-    async def _post(self, path, params={}):
+    async def _post(self, path, params):
         params.update({"recvWindow": config['recv_window']})
         query = urlencode(await self._sign(params))
         url = path
@@ -309,22 +394,18 @@ class BinancePortfolioMarginAPI:
                 return await response.json()
 
     def _order(self, market, quantity, side, rate=None):
-        params = {}
-
+        params = {"symbol": market, "side": side}
         if rate is not None:
             params["type"] = "LIMIT"
-            params["price"] = self._futures_format_price(market, rate)
+            params["price"] = self.futures_format_price(market, rate)
             params["timeInForce"] = "GTC"
+            params["quantity"] = self.futures_format_quantity_limit(market, quantity)
         else:
             params["type"] = "MARKET"
-
-        params["symbol"] = market
-        params["side"] = side
-        params["quantity"] = self._futures_format_quantity(market, quantity)
-
+            params["quantity"] = self.futures_format_quantity_market(market, quantity)
         return params
 
-    async def _delete(self, path, params={}):
+    async def _delete(self, path, params):
         params.update({"recvWindow": config['recv_window']})
         query = urlencode(await self._sign(params))
         url = "%s?%s" % (path, query)
@@ -342,7 +423,7 @@ class BinancePortfolioMarginAPI:
                         return f["tickSize"]
         raise ValueError(f"tickSize not found for symbol {symbol}")
 
-    def _get_step_size(self, symbol):
+    def _get_step_size_limit(self, symbol):
         for s in self.futures_exchange_info["symbols"]:
             if s["symbol"] == symbol:
                 for f in s["filters"]:
@@ -350,15 +431,28 @@ class BinancePortfolioMarginAPI:
                         return f["stepSize"]
         raise ValueError(f"stepSize not found for symbol {symbol}")
 
-    def _futures_format_price(self, symbol, price):
+    def _get_step_size_market(self, symbol):
+        f = self._get_symbol_filters(symbol).get("MARKET_LOT_SIZE")
+        if not f:
+            raise ValueError(f"MARKET_LOT_SIZE not found for {symbol}")
+        return f["stepSize"], f["minQty"], f["maxQty"]
+
+    def futures_format_price(self, symbol, price):
         tick_size = Decimal(self._get_tick_size(symbol))
         price = Decimal(str(price))
         # 四舍五入为 tick_size 的倍数
         steps = (price / tick_size).to_integral_value(rounding=ROUND_HALF_UP)
         return float(steps * tick_size)
 
-    def _futures_format_quantity(self, symbol, quantity):
-        step_size = Decimal(self._get_step_size(symbol))
+    def futures_format_quantity_limit(self, symbol, quantity):
+        step_size = Decimal(self._get_step_size_limit(symbol))
         quantity = Decimal(str(quantity))
         steps = (quantity / step_size).to_integral_value(rounding=ROUND_DOWN)
+        return float(steps * step_size)
+
+    def futures_format_quantity_market(self, symbol, quantity):
+        step, _, _ = self._get_step_size_market(symbol)
+        step_size = Decimal(str(step))
+        q = Decimal(str(quantity))
+        steps = (q / step_size).to_integral_value(rounding=ROUND_DOWN)
         return float(steps * step_size)

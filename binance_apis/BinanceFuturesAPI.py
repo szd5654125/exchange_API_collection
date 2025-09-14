@@ -4,7 +4,7 @@ import hmac
 from decimal import Decimal, ROUND_HALF_UP, ROUND_DOWN
 
 import requests
-from utils import config
+from utils.utils import config
 import aiohttp
 from urllib.parse import urlencode
 from warning_error_handlers import initial_retry_decorator, email_error_handler, exponential_backoff, log_error_handler
@@ -97,7 +97,11 @@ class BinanceFuturesAPI:
         for position in positions:
             if position.get("symbol") == market:
                 return float(position.get("positionAmt"))
-        return '0'
+        return 0.0
+
+    def _max_position_limit(self, symbol):
+        f = self._get_symbol_filters(symbol).get("MAX_POSITION")
+        return float(f["maxPosition"]) if f and "maxPosition" in f else None
 
     async def get_server_time(self) -> int:
         """直接返回 Binance 服务器时间，单位毫秒（int类型）"""
@@ -115,6 +119,20 @@ class BinanceFuturesAPI:
         async with aiohttp.ClientSession() as session:
             async with session.get(path, timeout=30, ssl=True) as response:
                 return await response.json()
+
+    def _get_symbol_filters(self, symbol):
+        for s in self.futures_exchange_info["symbols"]:
+            if s["symbol"] == symbol:
+                return {f["filterType"]: f for f in s["filters"]}
+        raise ValueError(f"filters not found for {symbol}")
+
+    async def get_current_leverage(self, symbol: str) -> int:
+        account_info = await self.get_account()
+        positions = account_info.get('positions', [])
+        for pos in positions:
+            if pos.get("symbol") == symbol:
+                return int(pos.get("leverage", 1))
+        raise ValueError(f"未找到交易对 {symbol} 的持仓信息")
 
     async def get_um_max_leverage(self, symbol: str, notional: float = 0.0) -> int:
         path = f"{self.BASE_FAPI_URL_V1}/leverageBracket"
@@ -175,32 +193,70 @@ class BinanceFuturesAPI:
         else:
             print(f"Margin mode already set to {self.multi_assets_margin}. No action needed.")
 
-    @initial_retry_decorator(retry_count=10, initial_delay=1, max_delay=30,
-                             error_handler=log_error_handler, backoff_strategy=exponential_backoff)
-    async def buy_limit(self, market, quantity, rate):
+    @initial_retry_decorator(retry_count=5, initial_delay=1, max_delay=30,
+                             error_handler=email_error_handler, backoff_strategy=exponential_backoff)
+    async def get_order_book_depth_sum(self, symbol: str, side: str, limit: int = 20) -> float:
+        allowed = {5, 10, 20, 50, 100, 500, 1000}
+        api_limit = min(x for x in allowed if x >= limit) if any(x >= limit for x in allowed) else max(allowed)
+        path = f"{self.BASE_FAPI_URL_V1}/depth"
+        params = {"symbol": symbol, "limit": api_limit}
+        data = await self._get_no_sign(path, params)
+        bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
+        asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
+        if side == "asks":
+            levels = asks
+        elif side == "bids":
+            levels = bids
+        else:
+            raise ValueError("side 必须是 'bids' 或 'asks'")
+        return sum(q for _, q in levels[:limit])
+
+    def lot_limits(self, symbol):
+        f = self._get_symbol_filters(symbol).get("LOT_SIZE")
+        if not f:
+            raise ValueError(f"LOT_SIZE not found for {symbol}")
+        return float(f["minQty"]), float(f["maxQty"]), float(f["stepSize"])
+
+    @initial_retry_decorator(retry_count=10, initial_delay=1, max_delay=30, error_handler=log_error_handler,
+                             backoff_strategy=exponential_backoff)
+    async def buy_limit(self, market, quantity, rate, client_order_id=None):
         path = "%s/order" % self.BASE_FAPI_URL_V1
         params = self._order(market, quantity, "BUY", rate)
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         return await self._post(path, params)
 
     @initial_retry_decorator(retry_count=10, initial_delay=1, max_delay=30, error_handler=email_error_handler,
                              backoff_strategy=exponential_backoff)
-    async def sell_limit(self, market, quantity, rate):
+    async def sell_limit(self, market, quantity, rate, client_order_id=None):
         path = "%s/order" % self.BASE_FAPI_URL_V1
         params = self._order(market, quantity, "SELL", rate)
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         return await self._post(path, params)
+
+    def market_lot_limits(self, symbol):
+        f = self._get_symbol_filters(symbol).get("MARKET_LOT_SIZE")
+        if not f:
+            raise ValueError(f"MARKET_LOT_SIZE not found for {symbol}")
+        return float(f["minQty"]), float(f["maxQty"]), float(f["stepSize"])
 
     @initial_retry_decorator(retry_count=10, initial_delay=1, max_delay=30, error_handler=email_error_handler,
                              backoff_strategy=exponential_backoff)
-    async def buy_market(self, market, quantity):
+    async def buy_market(self, market, quantity, client_order_id=None):
         path = f"{self.BASE_FAPI_URL_V1}/order"
         params = self._order(market, quantity, "BUY")
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         return await self._post(path, params)
 
     @initial_retry_decorator(retry_count=10, initial_delay=1, max_delay=30, error_handler=email_error_handler,
                              backoff_strategy=exponential_backoff)
-    async def sell_market(self, market, quantity):
+    async def sell_market(self, market, quantity, client_order_id=None):
         path = f"{self.BASE_FAPI_URL_V1}/order"
         params = self._order(market, quantity, "SELL")
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         return await self._post(path, params)
 
     async def get_best_bid_ask(self, symbol):
@@ -218,10 +274,16 @@ class BinanceFuturesAPI:
                              backoff_strategy=exponential_backoff)
     async def set_stop_market_order(self, symbol, side, quantity, stopPrice, closePosition=False):
         path = "%s/order" % self.BASE_FAPI_URL_V1
-        stop_price = self._futures_format_price(symbol, stopPrice)
-        quantity = self._futures_format_quantity(symbol, quantity)
-        params = {"symbol": symbol, "side": side, "type": "STOP_MARKET", "quantity": quantity, "stopPrice": stop_price,
-                  "closePosition": closePosition}
+        stop_price = self.futures_format_price(symbol, stopPrice)
+        qty_fmt = self.futures_format_quantity_market(symbol, quantity)
+        params = {
+            "symbol": symbol,
+            "side": side,
+            "type": "STOP_MARKET",
+            "quantity": qty_fmt,
+            "stopPrice": stop_price,
+            "closePosition": closePosition
+        }
         return await self._post(path, params)
 
     @initial_retry_decorator(retry_count=5, initial_delay=1, max_delay=30, error_handler=email_error_handler,
@@ -238,6 +300,12 @@ class BinanceFuturesAPI:
     async def get_last_24hr_price_change(self):
         path = "%s/ticker/24hr" % self.BASE_FAPI_URL_V1
         return await self._get_no_sign(path)
+
+    async def get_24h_usd_volume(self, symbol: str) -> float:
+        path = f"{self.BASE_FAPI_URL_V1}/ticker/24hr"
+        params = {"symbol": symbol}
+        data = await self._get_no_sign(path, params)
+        return float(data["quoteVolume"])
 
     async def get_usdt_24hr_price_change_ranking(self):
         try:
@@ -267,10 +335,35 @@ class BinanceFuturesAPI:
 
     @initial_retry_decorator(retry_count=10, initial_delay=5, max_delay=60, error_handler=email_error_handler,
                              backoff_strategy=exponential_backoff)
-    async def cancel_order(self, market, order_id):
+    async def cancel_order(self, market, order_id=None, client_order_id=None):
         path = "%s/order" % self.BASE_FAPI_URL_V1
-        params = {"symbol": market, "orderId": order_id}
+        params = {"symbol": market}
+        if order_id is not None:
+            params["orderId"] = order_id
+        if client_order_id is not None:
+            params["origClientOrderId"] = client_order_id
         return await self._delete(path, params)
+
+    @initial_retry_decorator(retry_count=10, initial_delay=5, max_delay=60, error_handler=email_error_handler,
+                             backoff_strategy=exponential_backoff)
+    async def cancel_stop_loss_orders(self, symbol):
+        try:
+            open_orders = await self.check_all_open_orders(symbol)
+            conditional_types = {
+                "STOP", "STOP_MARKET",
+                "TAKE_PROFIT", "TAKE_PROFIT_MARKET",
+                "TRAILING_STOP_MARKET"
+            }
+            results = []
+            for od in open_orders:
+                if od.get("type") in conditional_types:
+                    order_id = od.get("orderId")
+                    client_oid = od.get("clientOrderId")
+                    res = await self.cancel_order(symbol, order_id=order_id, client_order_id=client_oid)
+                    results.append(res)
+            return results
+        except Exception as e:
+            return {"error": str(e)}
 
     @initial_retry_decorator(retry_count=10, initial_delay=5, max_delay=60, error_handler=email_error_handler,
                              backoff_strategy=exponential_backoff)
@@ -279,14 +372,14 @@ class BinanceFuturesAPI:
         params = {"symbol": symbol}
         return await self._delete(path, params)
 
-    async def _get_no_sign(self, path, params={}):
+    async def _get_no_sign(self, path, params=None):
         query = urlencode(params)
         url = "%s?%s" % (path, query)
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=30, ssl=True) as response:
                 return await response.json()
 
-    async def _sign(self, params={}):
+    async def _sign(self, params):
         data = params.copy()
         ts = await self.get_server_time()
         data.update({"timestamp": ts})
@@ -297,7 +390,7 @@ class BinanceFuturesAPI:
         data.update({"signature": signature})
         return data
 
-    def _sign_sync(self, params={}):
+    def _sign_sync(self, params):
         data = params.copy()
         ts = int(1000 * time.time())
         data.update({"timestamp": ts})
@@ -308,7 +401,7 @@ class BinanceFuturesAPI:
         data.update({"signature": signature})
         return data
 
-    async def _get(self, path, params={}):
+    async def _get(self, path, params):
         params.update({"recvWindow": config['recv_window']})
         query = urlencode(await self._sign(params))
         url = f"{path}?{query}"
@@ -319,7 +412,7 @@ class BinanceFuturesAPI:
             async with session.get(url, headers=headers, ssl=True) as response:
                 return await response.json()
 
-    def _get_sync(self, path, params={}):
+    def _get_sync(self, path, params):
         params.update({"recvWindow": config['recv_window']})
         query = urlencode(self._sign_sync(params))
         url = f"{path}?{query}"
@@ -328,7 +421,7 @@ class BinanceFuturesAPI:
         response.raise_for_status()
         return response.json()
 
-    async def _post(self, path, params={}):
+    async def _post(self, path, params):
         params.update({"recvWindow": config['recv_window']})
         query = urlencode(await self._sign(params))
         url = path
@@ -339,22 +432,18 @@ class BinanceFuturesAPI:
                 return await response.json()
 
     def _order(self, market, quantity, side, rate=None):
-        params = {}
-
+        params = {"symbol": market, "side": side}
         if rate is not None:
             params["type"] = "LIMIT"
-            params["price"] = self._futures_format_price(market, rate)
+            params["price"] = self.futures_format_price(market, rate)
             params["timeInForce"] = "GTC"
+            params["quantity"] = self.futures_format_quantity_limit(market, quantity)
         else:
             params["type"] = "MARKET"
-
-        params["symbol"] = market
-        params["side"] = side
-        params["quantity"] = self._futures_format_quantity(market, quantity)
-
+            params["quantity"] = self.futures_format_quantity_market(market, quantity)
         return params
 
-    async def _delete(self, path, params={}):
+    async def _delete(self, path, params):
         params.update({"recvWindow": config['recv_window']})
         query = urlencode(await self._sign(params))  # 确保这里正确地生成了签名
         url = "%s?%s" % (path, query)
@@ -380,15 +469,34 @@ class BinanceFuturesAPI:
                         return f["stepSize"]
         raise ValueError(f"stepSize not found for symbol {symbol}")
 
-    def _futures_format_price(self, symbol, price):
+    def futures_format_price(self, symbol, price):
         tick_size = Decimal(self._get_tick_size(symbol))
         price = Decimal(str(price))
         # 四舍五入为 tick_size 的倍数
         steps = (price / tick_size).to_integral_value(rounding=ROUND_HALF_UP)
         return float(steps * tick_size)
 
-    def _futures_format_quantity(self, symbol, quantity):
-        step_size = Decimal(self._get_step_size(symbol))
-        quantity = Decimal(str(quantity))
-        steps = (quantity / step_size).to_integral_value(rounding=ROUND_DOWN)
+    def _get_step_size_limit(self, symbol):
+        _, _, step = self.lot_limits(symbol)
+        return step
+
+    def _get_step_size_market(self, symbol):
+        step = self._get_symbol_filters(symbol).get("MARKET_LOT_SIZE", {}).get("stepSize")
+        if step is None:
+            raise ValueError(f"MARKET_LOT_SIZE stepSize not found for {symbol}")
+        min_q = self._get_symbol_filters(symbol).get("MARKET_LOT_SIZE", {}).get("minQty")
+        max_q = self._get_symbol_filters(symbol).get("MARKET_LOT_SIZE", {}).get("maxQty")
+        return step, min_q, max_q
+
+    def futures_format_quantity_limit(self, symbol, quantity):
+        step_size = Decimal(str(self._get_step_size_limit(symbol)))
+        q = Decimal(str(quantity))
+        steps = (q / step_size).to_integral_value(rounding=ROUND_DOWN)
+        return float(steps * step_size)
+
+    def futures_format_quantity_market(self, symbol, quantity):
+        step, _, _ = self._get_step_size_market(symbol)
+        step_size = Decimal(str(step))
+        q = Decimal(str(quantity))
+        steps = (q / step_size).to_integral_value(rounding=ROUND_DOWN)
         return float(steps * step_size)
